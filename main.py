@@ -420,7 +420,8 @@ async def send_message(
     media_url: Optional[str],
     parse_mode: str,
 ) -> None:
-    max_text_length = 4000
+    codex/fix-tg_schedu-request-size-issue-ezoxb6
+    max_text_length = 3500
     max_caption_length = 1024
     attempts = 3
     for attempt in range(1, attempts + 1):
@@ -527,7 +528,9 @@ async def safe_reply(
     Returns:
         Message объект при успехе, None при неудаче после всех попыток
     """
-    max_text_length = 4000
+    codex/fix-tg_schedu-request-size-issue-ezoxb6
+    max_text_length = 3500
+ 
 
     async def reply_once(chunk: str, *, include_markup: bool) -> Optional[Message]:
         attempts = 3
