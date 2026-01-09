@@ -420,15 +420,39 @@ async def send_message(
     media_url: Optional[str],
     parse_mode: str,
 ) -> None:
+    max_text_length = 3500
+    max_caption_length = 1024
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
             if media_type and media_url:
                 sender_name = MEDIA_SENDERS[media_type]
                 sender = getattr(bot, sender_name)
-                await sender(chat_id=chat_id, caption=text, parse_mode=parse_mode, **{media_type: media_url})
+                if text and len(text) > max_caption_length:
+                    await sender(chat_id=chat_id, **{media_type: media_url})
+                    await send_text_chunks(
+                        bot,
+                        chat_id,
+                        text,
+                        parse_mode=parse_mode,
+                        max_length=max_text_length,
+                    )
+                else:
+                    await sender(
+                        chat_id=chat_id,
+                        caption=text or None,
+                        parse_mode=parse_mode if text else None,
+                        **{media_type: media_url},
+                    )
             else:
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, disable_web_page_preview=True)
+                await send_text_chunks(
+                    bot,
+                    chat_id,
+                    text,
+                    parse_mode=parse_mode,
+                    max_length=max_text_length,
+                    disable_web_page_preview=True,
+                )
             return
         except Exception as exc:
             if attempt == attempts:
@@ -437,6 +461,50 @@ async def send_message(
             sleep_for = attempt * 2
             logger.warning("Send failed (attempt %s/%s), retry in %ss: %s", attempt, attempts, sleep_for, exc)
             await asyncio.sleep(sleep_for)
+
+
+def split_text(text: str, max_length: int) -> List[str]:
+    if not text:
+        return [""]
+    lines = text.split("\n")
+    chunks: List[str] = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= max_length:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(line) <= max_length:
+            current = line
+            continue
+        start = 0
+        while start < len(line):
+            end = start + max_length
+            chunks.append(line[start:end])
+            start = end
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+async def send_text_chunks(
+    bot: Bot,
+    chat_id: str,
+    text: str,
+    parse_mode: Optional[str],
+    max_length: int,
+    **kwargs,
+) -> None:
+    for chunk in split_text(text, max_length):
+        await bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode=parse_mode,
+            **kwargs,
+        )
 
 
 async def safe_reply(
@@ -459,37 +527,50 @@ async def safe_reply(
     Returns:
         Message объект при успехе, None при неудаче после всех попыток
     """
-    attempts = 3
-    for attempt in range(1, attempts + 1):
-        try:
-            return await message.reply(
-                text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                **kwargs
-            )
-        except (TelegramNetworkError, OSError, ClientConnectorError, ClientOSError, ClientConnectorSSLError) as exc:
-            if attempt == attempts:
-                logger.exception(
-                    "Failed to reply to message %s after %s attempts: %s",
-                    message.message_id,
+    max_text_length = 3500
+
+    async def reply_once(chunk: str, *, include_markup: bool) -> Optional[Message]:
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                return await message.reply(
+                    chunk,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup if include_markup else None,
+                    **kwargs
+                )
+            except (TelegramNetworkError, OSError, ClientConnectorError, ClientOSError, ClientConnectorSSLError) as exc:
+                if attempt == attempts:
+                    logger.exception(
+                        "Failed to reply to message %s after %s attempts: %s",
+                        message.message_id,
+                        attempts,
+                        exc
+                    )
+                    return None
+                sleep_for = attempt * 2
+                logger.warning(
+                    "Reply failed (attempt %s/%s), retry in %ss: %s",
+                    attempt,
                     attempts,
+                    sleep_for,
                     exc
                 )
+                await asyncio.sleep(sleep_for)
+            except Exception as exc:
+                logger.exception("Unexpected error while replying: %s", exc)
                 return None
-            sleep_for = attempt * 2
-            logger.warning(
-                "Reply failed (attempt %s/%s), retry in %ss: %s",
-                attempt,
-                attempts,
-                sleep_for,
-                exc
-            )
-            await asyncio.sleep(sleep_for)
-        except Exception as exc:
-            # Для других ошибок не повторяем попытки
-            logger.exception("Unexpected error while replying: %s", exc)
+
+    chunks = split_text(text, max_text_length)
+    if len(chunks) == 1:
+        return await reply_once(chunks[0], include_markup=True)
+
+    last_message: Optional[Message] = None
+    for index, chunk in enumerate(chunks):
+        last_message = await reply_once(chunk, include_markup=index == len(chunks) - 1)
+        if last_message is None:
             return None
+    return last_message
 
 
 async def safe_answer(
