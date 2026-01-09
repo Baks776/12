@@ -657,7 +657,8 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📋 Список задач"), KeyboardButton(text="➕ Добавить задачу")],
             [KeyboardButton(text="✏️ Редактировать задачу"), KeyboardButton(text="🗑️ Удалить задачу")],
-            [KeyboardButton(text="💬 ID чата"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="🧹 Удалить чат"), KeyboardButton(text="💬 ID чата")],
+            [KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         persistent=True
@@ -2548,6 +2549,14 @@ async def main() -> None:
                 # Не показываем сообщение об отмене, чтобы не мешать пользователю
             # Перенаправляем на существующий обработчик
             await list_tasks_handler(message, state)
+
+        @dp.message(F.text == "🧹 Удалить чат")
+        @admin_only
+        async def menu_remove_chat_handler(message: Message, state: FSMContext, **kwargs) -> None:
+            current_state = await state.get_state()
+            if current_state:
+                await state.clear()
+            await remove_chat_handler(message)
         
         @dp.message(F.text == "➕ Добавить задачу")
         @admin_only
