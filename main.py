@@ -420,6 +420,7 @@ async def send_message(
     media_url: Optional[str],
     parse_mode: str,
 ) -> None:
+    codex/fix-tg_schedu-request-size-issue-ezoxb6
     max_text_length = 3500
     max_caption_length = 1024
     attempts = 3
@@ -527,7 +528,9 @@ async def safe_reply(
     Returns:
         Message объект при успехе, None при неудаче после всех попыток
     """
+    codex/fix-tg_schedu-request-size-issue-ezoxb6
     max_text_length = 3500
+ 
 
     async def reply_once(chunk: str, *, include_markup: bool) -> Optional[Message]:
         attempts = 3
@@ -2257,12 +2260,6 @@ async def main() -> None:
                     "/help - Справка\n"
                     "/cancel - Отмена операции",
                     reply_markup=get_main_menu_keyboard()
-                )
-            else:
-                # Если не админ, просто игнорируем или отправляем сообщение
-                await message.reply(
-                    "❌ У вас нет доступа к этому боту.",
-                    reply_markup=ReplyKeyboardRemove()
                 )
 
         try:
