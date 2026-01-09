@@ -134,6 +134,15 @@ class ChatStorage:
         """Получить все чаты."""
         return self.chats.copy()
 
+    def remove_chat(self, chat_id: str) -> bool:
+        """Удалить чат из списка."""
+        chat_id = str(chat_id)
+        if chat_id in self.chats:
+            del self.chats[chat_id]
+            self.save()
+            return True
+        return False
+
 
 @dataclass
 class Config:
@@ -768,6 +777,7 @@ async def main() -> None:
                 "/list_tasks - список задач\n"
                 "/delete_task - удалить задачу\n"
                 "/edit_task - редактировать задачу\n"
+                "/remove_chat - удалить чат из списка\n"
                 "/help - помощь" + admin_text,
                 reply_markup=get_main_menu_keyboard()
             )
@@ -801,6 +811,8 @@ async def main() -> None:
 /delete_task <ID> - Удалить задачу по ID
 
 /edit_task <ID> - Редактировать задачу (интерактивно)
+
+/remove_chat - Удалить чат из списка (не удаляет задачи)
 
 /chat_id - Узнать ID текущего чата
 
@@ -840,6 +852,112 @@ async def main() -> None:
                     reply_markup=get_main_menu_keyboard()
                 )
 
+        def build_remove_chat_list() -> Tuple[str, InlineKeyboardMarkup]:
+            chats = chat_storage.get_all_chats()
+            if not chats:
+                text = "📋 Список чатов пуст."
+                keyboard = [[InlineKeyboardButton(text="❌ Закрыть", callback_data="remove_chat_cancel")]]
+                return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+            text = "🗑️ <b>Удаление чата из списка</b>\n\nВыберите чат для удаления:"
+            keyboard = []
+            for chat_id, chat_info in chats.items():
+                title = chat_info.get("title") or "Без названия"
+                if title == f"Чат {chat_id}":
+                    title = "Без названия"
+                keyboard.append([InlineKeyboardButton(
+                    text=f"🗑️ {title} ({chat_id})",
+                    callback_data=f"remove_chat_{chat_id}"
+                )])
+
+            keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="remove_chat_cancel")])
+            return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+        @dp.message(Command("remove_chat"))
+        @admin_only
+        async def remove_chat_handler(message: Message) -> None:
+            text, markup = build_remove_chat_list()
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.callback_query(F.data == "remove_chat_list")
+        @admin_only
+        async def remove_chat_list_callback(callback: CallbackQuery) -> None:
+            text, markup = build_remove_chat_list()
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            await callback.answer()
+
+        @dp.callback_query(F.data == "remove_chat_cancel")
+        @admin_only
+        async def remove_chat_cancel_callback(callback: CallbackQuery) -> None:
+            await callback.message.edit_text("❌ Удаление чатов отменено.")
+            await callback.answer()
+
+        @dp.callback_query(F.data.startswith("remove_chat_confirm_"))
+        @admin_only
+        async def remove_chat_confirm_callback(callback: CallbackQuery) -> None:
+            chat_id = callback.data.replace("remove_chat_confirm_", "")
+            removed = chat_storage.remove_chat(chat_id)
+            if removed:
+                await callback.message.edit_text(
+                    f"✅ Чат <code>{escape(chat_id)}</code> удалён из списка.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            else:
+                await callback.message.edit_text(
+                    "❌ Чат не найден.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            await callback.answer()
+
+        @dp.callback_query(F.data.startswith("remove_chat_") & ~F.data.startswith("remove_chat_confirm_"))
+        @admin_only
+        async def remove_chat_select_callback(callback: CallbackQuery) -> None:
+            chat_id = callback.data.replace("remove_chat_", "")
+            tasks_in_chat = [task for task in storage.get_all_tasks() if task.chat_id == str(chat_id)]
+            task_count = len(tasks_in_chat)
+
+            title = chat_storage.get_chat_title(chat_id)
+            if title == f"Чат {chat_id}":
+                title = "Без названия"
+            if task_count > 0:
+                await callback.message.edit_text(
+                    "⚠️ <b>Подтверждение удаления</b>\n\n"
+                    f"Чат: {escape(title)}\n"
+                    f"ID: <code>{escape(chat_id)}</code>\n"
+                    f"Связанных задач: {task_count}\n\n"
+                    "Удалить чат из списка? Задачи останутся.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Удалить", callback_data=f"remove_chat_confirm_{chat_id}")],
+                        [InlineKeyboardButton(text="↩️ Назад", callback_data="remove_chat_list")]
+                    ])
+                )
+                await callback.answer()
+                return
+
+            removed = chat_storage.remove_chat(chat_id)
+            if removed:
+                await callback.message.edit_text(
+                    f"✅ Чат <code>{escape(chat_id)}</code> удалён из списка.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            else:
+                await callback.message.edit_text(
+                    "❌ Чат не найден.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            await callback.answer()
+
         @dp.message(Command("add_task"))
         @admin_only
         async def add_task_handler(message: Message, state: FSMContext) -> None:
@@ -863,6 +981,8 @@ async def main() -> None:
             for chat_id, chat_info in chats.items():
                 if chat_id != current_chat_id:
                     title = chat_info.get("title", chat_id)
+                    if title == f"Чат {chat_id}":
+                        title = "Без названия"
                     keyboard.append([InlineKeyboardButton(
                         text=f"💬 {title} ({chat_id})",
                         callback_data=f"select_chat_{chat_id}"
@@ -894,11 +1014,13 @@ async def main() -> None:
         async def add_chat_manual_callback(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(
                 "💬 <b>Добавление чата по ID</b>\n\n"
-                "Введите ID чата/группы для добавления.\n\n"
+                "Введите ID чата/группы для добавления.\n"
+                "Можно указать название после ID через пробел.\n\n"
                 "💡 <b>Как узнать ID:</b>\n"
                 "• Для группы: добавьте бота в группу и отправьте /chat_id\n"
                 "• ID группы обычно начинается с -100 (например: -1001234567890)\n"
                 "• ID личного чата - это просто число (ваш Telegram ID)\n\n"
+                "Пример: -1001234567890 Моя группа\n\n"
                 "Или отправьте /cancel для отмены.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -934,10 +1056,14 @@ async def main() -> None:
                 await state.clear()
                 return
             
+            parts = chat_id_input.split(maxsplit=1)
+            chat_id_token = parts[0]
+            chat_title_input = parts[1].strip() if len(parts) > 1 else ""
+
             # Валидация chat_id (должен быть числом, может быть отрицательным для групп)
             try:
                 # Проверяем, что это число (может быть отрицательным)
-                chat_id = str(int(chat_id_input))
+                chat_id = str(int(chat_id_token))
             except ValueError:
                 await safe_reply(
                     message,
@@ -951,7 +1077,7 @@ async def main() -> None:
                 return
             
             # Добавляем чат в хранилище
-            chat_storage.add_chat(chat_id, f"Чат {chat_id}", "unknown")
+            chat_storage.add_chat(chat_id, chat_title_input or f"Чат {chat_id}", "unknown")
             
             # Сохраняем chat_id в состоянии и переходим к выбору времени
             await state.update_data(chat_id=chat_id)
