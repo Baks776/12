@@ -1768,20 +1768,20 @@ async def main() -> None:
             # Если это длинный task_id, возвращаем как есть
             return callback_prefix
 
-        @dp.message(Command("edit_task"))
-        @admin_only
-        async def edit_task_handler(message: Message) -> None:
-            tasks = storage.get_all_tasks()
-            if not tasks:
-                await message.reply("📋 Задач пока нет. Используйте /add_task для добавления.")
-                return
-            
-            # Показываем список задач с кнопками для редактирования
+        EDIT_TASK_PAGE_SIZE = 20
+
+        def build_edit_task_page(tasks: List[Task], offset: int) -> Tuple[str, InlineKeyboardMarkup]:
+            total_tasks = len(tasks)
+            end_index = min(offset + EDIT_TASK_PAGE_SIZE, total_tasks)
+            page_tasks = tasks[offset:end_index]
+
             keyboard = []
             import hashlib
-            for i, task in enumerate(tasks[:20], 1):  # Ограничиваем 20 задач
+            for i, task in enumerate(page_tasks, offset + 1):
                 chat_title = chat_storage.get_chat_title(task.chat_id)
-                task_preview = f"{i}. {task.time_str} - {task.message[:30]}... ({chat_title})"
+                message_preview = task.message[:30]
+                preview_suffix = "..." if len(task.message) > 30 else ""
+                task_preview = f"{i}. {task.time_str} - {message_preview}{preview_suffix} ({chat_title})"
                 # Используем хеш если task_id слишком длинный
                 if len(task.task_id) > 40:
                     task_id_hash = hashlib.md5(task.task_id.encode()).hexdigest()[:16]
@@ -1792,22 +1792,48 @@ async def main() -> None:
                     text=task_preview,
                     callback_data=callback_data
                 )])
-            
-            if len(tasks) > 20:
-                keyboard.append([InlineKeyboardButton(
-                    text=f"Показать еще ({len(tasks) - 20})",
+
+            navigation = []
+            if offset > 0:
+                navigation.append(InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="edit_task_prev"
+                ))
+            remaining = total_tasks - end_index
+            if remaining > 0:
+                navigation.append(InlineKeyboardButton(
+                    text=f"Показать еще ({remaining})",
                     callback_data="edit_task_more"
-                )])
-            
+                ))
+            if navigation:
+                keyboard.append(navigation)
+
             keyboard.append([InlineKeyboardButton(
                 text="❌ Отмена",
                 callback_data="cancel_edit"
             )])
-            
-            await message.reply(
+
+            page_text = (
                 "📝 <b>Редактирование задач</b>\n\n"
-                "Выберите задачу для редактирования:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+                f"Показаны задачи {offset + 1}-{end_index} из {total_tasks}.\n"
+                "Выберите задачу для редактирования:"
+            )
+            return page_text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+        @dp.message(Command("edit_task"))
+        @admin_only
+        async def edit_task_handler(message: Message, state: FSMContext) -> None:
+            tasks = storage.get_all_tasks()
+            if not tasks:
+                await message.reply("📋 Задач пока нет. Используйте /add_task для добавления.")
+                return
+
+            await state.update_data(edit_task_offset=0)
+            page_text, markup = build_edit_task_page(tasks, 0)
+
+            await message.reply(
+                page_text,
+                reply_markup=markup,
                 parse_mode="HTML"
             )
 
@@ -1817,8 +1843,30 @@ async def main() -> None:
         async def edit_task_select_callback(callback: CallbackQuery, state: FSMContext, **kwargs) -> None:
             callback_prefix = callback.data.replace("edit_task_", "")
             
-            if callback_prefix == "more":
-                await callback.answer("Функция 'Показать еще' в разработке")
+            if callback_prefix in {"more", "prev"}:
+                tasks = storage.get_all_tasks()
+                if not tasks:
+                    await callback.answer("📋 Задач пока нет.", show_alert=True)
+                    return
+
+                data = await state.get_data()
+                offset = data.get("edit_task_offset", 0)
+                if callback_prefix == "more":
+                    offset += EDIT_TASK_PAGE_SIZE
+                else:
+                    offset -= EDIT_TASK_PAGE_SIZE
+
+                max_offset = ((len(tasks) - 1) // EDIT_TASK_PAGE_SIZE) * EDIT_TASK_PAGE_SIZE
+                offset = max(0, min(offset, max_offset))
+                await state.update_data(edit_task_offset=offset)
+
+                page_text, markup = build_edit_task_page(tasks, offset)
+                await callback.message.edit_text(
+                    page_text,
+                    reply_markup=markup,
+                    parse_mode="HTML"
+                )
+                await callback.answer()
                 return
             
             # Получаем реальный task_id
