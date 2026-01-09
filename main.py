@@ -2177,12 +2177,6 @@ async def main() -> None:
                     "/cancel - Отмена операции",
                     reply_markup=get_main_menu_keyboard()
                 )
-            else:
-                # Если не админ, просто игнорируем или отправляем сообщение
-                await message.reply(
-                    "❌ У вас нет доступа к этому боту.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
 
         try:
             await dp.start_polling(bot)
