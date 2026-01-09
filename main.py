@@ -853,8 +853,9 @@ async def main() -> None:
             keyboard = []
             
             # Добавляем кнопку "Текущий чат"
+            current_title = message.chat.title or "Без названия"
             keyboard.append([InlineKeyboardButton(
-                text=f"📱 Текущий чат ({message.chat.title or current_chat_id})",
+                text=f"📱 Текущий чат ({current_title}, {current_chat_id})",
                 callback_data=f"select_chat_{current_chat_id}"
             )])
             
@@ -863,7 +864,7 @@ async def main() -> None:
                 if chat_id != current_chat_id:
                     title = chat_info.get("title", chat_id)
                     keyboard.append([InlineKeyboardButton(
-                        text=f"💬 {title}",
+                        text=f"💬 {title} ({chat_id})",
                         callback_data=f"select_chat_{chat_id}"
                     )])
             
@@ -1979,6 +1980,7 @@ async def main() -> None:
                 return
             
             # Получаем реальный task_id
+            await state.clear()
             task_id = await get_real_task_id(callback_prefix, state)
             task = storage.get_task(task_id)
             if not task:
@@ -2013,7 +2015,8 @@ async def main() -> None:
         # Обработчик отмены редактирования
         @dp.callback_query(F.data == "cancel_edit")
         @admin_only
-        async def cancel_edit_callback(callback: CallbackQuery) -> None:
+        async def cancel_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+            await state.clear()
             await callback.message.edit_text("❌ Редактирование отменено.")
             await callback.answer()
 
