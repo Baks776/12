@@ -15,7 +15,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
+import redis.asyncio as redis
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.exceptions import TelegramNetworkError
 from aiohttp.client_exceptions import ClientConnectorError, ClientOSError, ClientConnectorSSLError
@@ -121,11 +123,14 @@ class ChatStorage:
 
     def add_chat(self, chat_id: str, title: str = "", chat_type: str = "") -> None:
         """Добавить чат в список."""
-        self.chats[str(chat_id)] = {
+        chat_id_str = str(chat_id)
+        new_record = {
             "title": title or f"Чат {chat_id}",
             "type": chat_type or "unknown"
         }
-        self.save()
+        if self.chats.get(chat_id_str) != new_record:
+            self.chats[chat_id_str] = new_record
+            self.save()
 
     def get_chat_title(self, chat_id: str) -> str:
         """Получить название чата."""
@@ -166,13 +171,36 @@ class Config:
         )
 
 
-def write_json_atomic(file_path: Path, data: dict, *, backup: bool = False) -> None:
+def cleanup_backups(file_path: Path, *, backup_limit: int) -> None:
+    if backup_limit <= 0:
+        return
+    pattern = f"{file_path.name}.*.bak"
+    backups = sorted(
+        file_path.parent.glob(pattern),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True
+    )
+    for backup_path in backups[backup_limit:]:
+        try:
+            backup_path.unlink()
+        except OSError:
+            logger.warning("Failed to remove backup %s", backup_path)
+
+
+def write_json_atomic(
+    file_path: Path,
+    data: dict,
+    *,
+    backup: bool = False,
+    backup_limit: int = 20
+) -> None:
     tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
         if backup and file_path.exists():
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             backup_path = file_path.with_suffix(f"{file_path.suffix}.{timestamp}.bak")
             shutil.copy2(file_path, backup_path)
+            cleanup_backups(file_path, backup_limit=backup_limit)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, file_path)
@@ -290,7 +318,7 @@ class TaskStorage:
         """Сохранить задачи в файл."""
         try:
             data = {task_id: task.to_dict() for task_id, task in self.tasks.items()}
-            write_json_atomic(self.file_path, data, backup=True)
+            write_json_atomic(self.file_path, data, backup=True, backup_limit=20)
             logger.info("Saved %d tasks to %s", len(self.tasks), self.file_path)
         except Exception as exc:
             logger.error("Failed to save tasks: %s", exc)
@@ -423,7 +451,11 @@ def parse_weekdays(value: str) -> Optional[List[str]]:
         if not mapped:
             raise ValueError(f"Unknown weekday: {token}")
         result.append(mapped)
-    return result or None
+    if not result:
+        return None
+    order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    unique = {day for day in result}
+    return [day for day in order if day in unique]
 
 
 def parse_monthday(value: str) -> Optional[int]:
@@ -706,7 +738,16 @@ async def main() -> None:
     # Инициализация бота
     # Обработка сетевых ошибок выполняется через функцию safe_reply()
     async with Bot(token=config.telegram_token) as bot:
-        dp = Dispatcher(storage=RedisStorage.from_url(config.redis_url))
+        storage_backend = MemoryStorage()
+        try:
+            redis_client = redis.from_url(config.redis_url)
+            await redis_client.ping()
+            await redis_client.close()
+            storage_backend = RedisStorage.from_url(config.redis_url)
+            logger.info("FSM storage: Redis (%s)", config.redis_url)
+        except Exception as exc:
+            logger.error("Redis unavailable, falling back to MemoryStorage: %s", exc)
+        dp = Dispatcher(storage=storage_backend)
         scheduler = TaskScheduler(bot=bot, config=config, storage=storage)
         await scheduler.start()
 
