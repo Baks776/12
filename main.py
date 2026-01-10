@@ -2,11 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from html import escape
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
@@ -14,6 +16,8 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+import redis.asyncio as redis
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.exceptions import TelegramNetworkError
 from aiohttp.client_exceptions import ClientConnectorError, ClientOSError, ClientConnectorSSLError
@@ -80,6 +84,15 @@ class DeleteTaskStates(StatesGroup):
     waiting_for_task_number = State()
 
 
+class EditTaskStates(StatesGroup):
+    """Состояния для редактирования задачи."""
+    waiting_for_time = State()
+    waiting_for_message = State()
+    waiting_for_weekdays = State()
+    waiting_for_monthday = State()
+    waiting_for_media = State()
+
+
 class ChatStorage:
     """Хранилище известных чатов/групп."""
     def __init__(self, file_path: str = "chats.json"):
@@ -104,18 +117,20 @@ class ChatStorage:
     def save(self) -> None:
         """Сохранить список чатов в файл."""
         try:
-            with open(self.file_path, "w", encoding="utf-8") as f:
-                json.dump(self.chats, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.file_path, self.chats)
         except Exception as exc:
             logger.error("Failed to save chats: %s", exc)
 
     def add_chat(self, chat_id: str, title: str = "", chat_type: str = "") -> None:
         """Добавить чат в список."""
-        self.chats[str(chat_id)] = {
+        chat_id_str = str(chat_id)
+        new_record = {
             "title": title or f"Чат {chat_id}",
             "type": chat_type or "unknown"
         }
-        self.save()
+        if self.chats.get(chat_id_str) != new_record:
+            self.chats[chat_id_str] = new_record
+            self.save()
 
     def get_chat_title(self, chat_id: str) -> str:
         """Получить название чата."""
@@ -125,6 +140,15 @@ class ChatStorage:
         """Получить все чаты."""
         return self.chats.copy()
 
+    def remove_chat(self, chat_id: str) -> bool:
+        """Удалить чат из списка."""
+        chat_id = str(chat_id)
+        if chat_id in self.chats:
+            del self.chats[chat_id]
+            self.save()
+            return True
+        return False
+
 
 @dataclass
 class Config:
@@ -133,6 +157,7 @@ class Config:
     admins_file: str = "admins.json"
     timezone: str = "Europe/Moscow"
     parse_mode: str = "HTML"
+    redis_url: str = "redis://localhost:6379/0"
 
     @staticmethod
     def from_env() -> "Config":
@@ -142,7 +167,47 @@ class Config:
             admins_file=os.environ.get("ADMINS_FILE", "admins.json"),
             timezone=os.environ.get("TZ", "Europe/Moscow"),
             parse_mode=os.environ.get("DEFAULT_PARSE_MODE", "HTML"),
+            redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
         )
+
+
+def cleanup_backups(file_path: Path, *, backup_limit: int) -> None:
+    if backup_limit <= 0:
+        return
+    pattern = f"{file_path.name}.*.bak"
+    backups = sorted(
+        file_path.parent.glob(pattern),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True
+    )
+    for backup_path in backups[backup_limit:]:
+        try:
+            backup_path.unlink()
+        except OSError:
+            logger.warning("Failed to remove backup %s", backup_path)
+
+
+def write_json_atomic(
+    file_path: Path,
+    data: dict,
+    *,
+    backup: bool = False,
+    backup_limit: int = 20
+) -> None:
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    try:
+        if backup and file_path.exists():
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            backup_path = file_path.with_suffix(f"{file_path.suffix}.{timestamp}.bak")
+            shutil.copy2(file_path, backup_path)
+            cleanup_backups(file_path, backup_limit=backup_limit)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 @dataclass
@@ -193,8 +258,7 @@ class AdminManager:
         """Сохранить список админов в файл."""
         try:
             data = {"admins": list(self.admins)}
-            with open(self.file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.file_path, data)
             logger.info("Saved %d admins to %s", len(self.admins), self.file_path)
         except Exception as exc:
             logger.error("Failed to save admins: %s", exc)
@@ -254,8 +318,7 @@ class TaskStorage:
         """Сохранить задачи в файл."""
         try:
             data = {task_id: task.to_dict() for task_id, task in self.tasks.items()}
-            with open(self.file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.file_path, data, backup=True, backup_limit=20)
             logger.info("Saved %d tasks to %s", len(self.tasks), self.file_path)
         except Exception as exc:
             logger.error("Failed to save tasks: %s", exc)
@@ -388,7 +451,11 @@ def parse_weekdays(value: str) -> Optional[List[str]]:
         if not mapped:
             raise ValueError(f"Unknown weekday: {token}")
         result.append(mapped)
-    return result or None
+    if not result:
+        return None
+    order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    unique = {day for day in result}
+    return [day for day in order if day in unique]
 
 
 def parse_monthday(value: str) -> Optional[int]:
@@ -420,7 +487,6 @@ async def send_message(
     media_url: Optional[str],
     parse_mode: str,
 ) -> None:
-    codex/fix-tg_schedu-request-size-issue-ezoxb6
     max_text_length = 3500
     max_caption_length = 1024
     attempts = 3
@@ -528,7 +594,6 @@ async def safe_reply(
     Returns:
         Message объект при успехе, None при неудаче после всех попыток
     """
-    codex/fix-tg_schedu-request-size-issue-ezoxb6
     max_text_length = 3500
  
 
@@ -625,12 +690,7 @@ async def safe_answer(
 
 def generate_task_id(chat_id: str, time_str: str, weekdays: Optional[List[str]], monthday: Optional[int], message: str = "") -> str:
     """Генерировать уникальный ID задачи."""
-    import hashlib
-    weekday_str = ",".join(sorted(weekdays)) if weekdays else "any"
-    monthday_str = str(monthday) if monthday else "any"
-    # Добавляем хеш сообщения для уникальности
-    msg_hash = hashlib.md5(message.encode()).hexdigest()[:8]
-    return f"{chat_id}-{time_str}-{weekday_str}-{monthday_str}-{msg_hash}"
+    return str(uuid4())
 
 
 def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -639,7 +699,8 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📋 Список задач"), KeyboardButton(text="➕ Добавить задачу")],
             [KeyboardButton(text="✏️ Редактировать задачу"), KeyboardButton(text="🗑️ Удалить задачу")],
-            [KeyboardButton(text="💬 ID чата"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="🧹 Удалить чат"), KeyboardButton(text="💬 ID чата")],
+            [KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         persistent=True
@@ -677,13 +738,21 @@ async def main() -> None:
     # Инициализация бота
     # Обработка сетевых ошибок выполняется через функцию safe_reply()
     async with Bot(token=config.telegram_token) as bot:
-        dp = Dispatcher(storage=MemoryStorage())
+        storage_backend = MemoryStorage()
+        try:
+            redis_client = redis.from_url(config.redis_url)
+            await redis_client.ping()
+            await redis_client.close()
+            storage_backend = RedisStorage.from_url(config.redis_url)
+            logger.info("FSM storage: Redis (%s)", config.redis_url)
+        except Exception as exc:
+            logger.error("Redis unavailable, falling back to MemoryStorage: %s", exc)
+        dp = Dispatcher(storage=storage_backend)
         scheduler = TaskScheduler(bot=bot, config=config, storage=storage)
         await scheduler.start()
 
         # Декоратор для проверки прав админа
         def admin_only(func):
-            import inspect
             import functools
             
             @functools.wraps(func)
@@ -759,6 +828,7 @@ async def main() -> None:
                 "/list_tasks - список задач\n"
                 "/delete_task - удалить задачу\n"
                 "/edit_task - редактировать задачу\n"
+                "/remove_chat - удалить чат из списка\n"
                 "/help - помощь" + admin_text,
                 reply_markup=get_main_menu_keyboard()
             )
@@ -793,6 +863,8 @@ async def main() -> None:
 
 /edit_task <ID> - Редактировать задачу (интерактивно)
 
+/remove_chat - Удалить чат из списка (не удаляет задачи)
+
 /chat_id - Узнать ID текущего чата
 
 💡 Используйте кнопки меню для быстрого доступа к функциям!
@@ -811,11 +883,11 @@ async def main() -> None:
                 chat_storage.add_chat(chat_id, chat_title, chat_type)
                 
                 # Формируем информативное сообщение
-                chat_info = f"📋 <b>Информация о чате:</b>\n\n"
+                chat_info = "📋 <b>Информация о чате:</b>\n\n"
                 chat_info += f"🆔 <b>ID чата:</b> <code>{escape(chat_id)}</code>\n"
                 chat_info += f"📝 <b>Название:</b> {escape(chat_title)}\n"
                 chat_info += f"📂 <b>Тип:</b> {escape(chat_type)}\n\n"
-                chat_info += f"✅ Чат добавлен в список для выбора при создании задач."
+                chat_info += "✅ Чат добавлен в список для выбора при создании задач."
                 
                 await safe_reply(
                     message,
@@ -831,6 +903,112 @@ async def main() -> None:
                     reply_markup=get_main_menu_keyboard()
                 )
 
+        def build_remove_chat_list() -> Tuple[str, InlineKeyboardMarkup]:
+            chats = chat_storage.get_all_chats()
+            if not chats:
+                text = "📋 Список чатов пуст."
+                keyboard = [[InlineKeyboardButton(text="❌ Закрыть", callback_data="remove_chat_cancel")]]
+                return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+            text = "🗑️ <b>Удаление чата из списка</b>\n\nВыберите чат для удаления:"
+            keyboard = []
+            for chat_id, chat_info in chats.items():
+                title = chat_info.get("title") or "Без названия"
+                if title == f"Чат {chat_id}":
+                    title = "Без названия"
+                keyboard.append([InlineKeyboardButton(
+                    text=f"🗑️ {title} ({chat_id})",
+                    callback_data=f"remove_chat_{chat_id}"
+                )])
+
+            keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="remove_chat_cancel")])
+            return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+        @dp.message(Command("remove_chat"))
+        @admin_only
+        async def remove_chat_handler(message: Message) -> None:
+            text, markup = build_remove_chat_list()
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.callback_query(F.data == "remove_chat_list")
+        @admin_only
+        async def remove_chat_list_callback(callback: CallbackQuery) -> None:
+            text, markup = build_remove_chat_list()
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            await callback.answer()
+
+        @dp.callback_query(F.data == "remove_chat_cancel")
+        @admin_only
+        async def remove_chat_cancel_callback(callback: CallbackQuery) -> None:
+            await callback.message.edit_text("❌ Удаление чатов отменено.")
+            await callback.answer()
+
+        @dp.callback_query(F.data.startswith("remove_chat_confirm_"))
+        @admin_only
+        async def remove_chat_confirm_callback(callback: CallbackQuery) -> None:
+            chat_id = callback.data.replace("remove_chat_confirm_", "")
+            removed = chat_storage.remove_chat(chat_id)
+            if removed:
+                await callback.message.edit_text(
+                    f"✅ Чат <code>{escape(chat_id)}</code> удалён из списка.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            else:
+                await callback.message.edit_text(
+                    "❌ Чат не найден.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            await callback.answer()
+
+        @dp.callback_query(F.data.startswith("remove_chat_") & ~F.data.startswith("remove_chat_confirm_"))
+        @admin_only
+        async def remove_chat_select_callback(callback: CallbackQuery) -> None:
+            chat_id = callback.data.replace("remove_chat_", "")
+            tasks_in_chat = [task for task in storage.get_all_tasks() if task.chat_id == str(chat_id)]
+            task_count = len(tasks_in_chat)
+
+            title = chat_storage.get_chat_title(chat_id)
+            if title == f"Чат {chat_id}":
+                title = "Без названия"
+            if task_count > 0:
+                await callback.message.edit_text(
+                    "⚠️ <b>Подтверждение удаления</b>\n\n"
+                    f"Чат: {escape(title)}\n"
+                    f"ID: <code>{escape(chat_id)}</code>\n"
+                    f"Связанных задач: {task_count}\n\n"
+                    "Удалить чат из списка? Задачи останутся.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Удалить", callback_data=f"remove_chat_confirm_{chat_id}")],
+                        [InlineKeyboardButton(text="↩️ Назад", callback_data="remove_chat_list")]
+                    ])
+                )
+                await callback.answer()
+                return
+
+            removed = chat_storage.remove_chat(chat_id)
+            if removed:
+                await callback.message.edit_text(
+                    f"✅ Чат <code>{escape(chat_id)}</code> удалён из списка.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            else:
+                await callback.message.edit_text(
+                    "❌ Чат не найден.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="📋 К списку", callback_data="remove_chat_list")
+                    ]])
+                )
+            await callback.answer()
+
         @dp.message(Command("add_task"))
         @admin_only
         async def add_task_handler(message: Message, state: FSMContext) -> None:
@@ -844,8 +1022,9 @@ async def main() -> None:
             keyboard = []
             
             # Добавляем кнопку "Текущий чат"
+            current_title = message.chat.title or "Без названия"
             keyboard.append([InlineKeyboardButton(
-                text=f"📱 Текущий чат ({message.chat.title or current_chat_id})",
+                text=f"📱 Текущий чат ({current_title}, {current_chat_id})",
                 callback_data=f"select_chat_{current_chat_id}"
             )])
             
@@ -853,8 +1032,10 @@ async def main() -> None:
             for chat_id, chat_info in chats.items():
                 if chat_id != current_chat_id:
                     title = chat_info.get("title", chat_id)
+                    if title == f"Чат {chat_id}":
+                        title = "Без названия"
                     keyboard.append([InlineKeyboardButton(
-                        text=f"💬 {title}",
+                        text=f"💬 {title} ({chat_id})",
                         callback_data=f"select_chat_{chat_id}"
                     )])
             
@@ -884,11 +1065,13 @@ async def main() -> None:
         async def add_chat_manual_callback(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(
                 "💬 <b>Добавление чата по ID</b>\n\n"
-                "Введите ID чата/группы для добавления.\n\n"
+                "Введите ID чата/группы для добавления.\n"
+                "Можно указать название после ID через пробел.\n\n"
                 "💡 <b>Как узнать ID:</b>\n"
                 "• Для группы: добавьте бота в группу и отправьте /chat_id\n"
                 "• ID группы обычно начинается с -100 (например: -1001234567890)\n"
                 "• ID личного чата - это просто число (ваш Telegram ID)\n\n"
+                "Пример: -1001234567890 Моя группа\n\n"
                 "Или отправьте /cancel для отмены.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -924,24 +1107,28 @@ async def main() -> None:
                 await state.clear()
                 return
             
+            parts = chat_id_input.split(maxsplit=1)
+            chat_id_token = parts[0]
+            chat_title_input = parts[1].strip() if len(parts) > 1 else ""
+
             # Валидация chat_id (должен быть числом, может быть отрицательным для групп)
             try:
                 # Проверяем, что это число (может быть отрицательным)
-                chat_id = str(int(chat_id_input))
+                chat_id = str(int(chat_id_token))
             except ValueError:
                 await safe_reply(
                     message,
-                    f"❌ Неверный формат ID. ID должен быть числом.\n\n"
-                    f"Примеры:\n"
-                    f"• Для группы: -1001234567890\n"
-                    f"• Для личного чата: 123456789\n\n"
-                    f"Попробуйте еще раз или отправьте /cancel для отмены.",
+                    "❌ Неверный формат ID. ID должен быть числом.\n\n"
+                    "Примеры:\n"
+                    "• Для группы: -1001234567890\n"
+                    "• Для личного чата: 123456789\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены.",
                     reply_markup=ReplyKeyboardRemove()
                 )
                 return
             
             # Добавляем чат в хранилище
-            chat_storage.add_chat(chat_id, f"Чат {chat_id}", "unknown")
+            chat_storage.add_chat(chat_id, chat_title_input or f"Чат {chat_id}", "unknown")
             
             # Сохраняем chat_id в состоянии и переходим к выбору времени
             await state.update_data(chat_id=chat_id)
@@ -1190,16 +1377,21 @@ async def main() -> None:
             
             # Показываем клавиатуру для выбора числа месяца
             keyboard = []
-            # Числа 1-31 в виде кнопок (по 5 в ряд)
+            # Популярные числа месяца (ограниченный набор)
             row = []
-            for i in range(1, 32):
-                row.append(InlineKeyboardButton(text=str(i), callback_data=f"select_monthday_{i}"))
-                if len(row) == 5:
+            popular_days = [1, 5, 10, 15, 20, 25, 28, 30, 31]
+            for day in popular_days:
+                row.append(InlineKeyboardButton(text=str(day), callback_data=f"select_monthday_{day}"))
+                if len(row) == 4:
                     keyboard.append(row)
                     row = []
             if row:
                 keyboard.append(row)
-            
+
+            keyboard.append([InlineKeyboardButton(
+                text="✏️ Ввести число вручную",
+                callback_data="enter_monthday_manual"
+            )])
             keyboard.append([InlineKeyboardButton(
                 text="✅ Пропустить (любое число)",
                 callback_data="skip_monthday"
@@ -1217,6 +1409,76 @@ async def main() -> None:
             await callback.answer()
             await state.set_state(TaskCreationStates.waiting_for_monthday)
 
+        async def prompt_media_type_after_monthday(message_or_callback, state: FSMContext, monthday_label: str) -> None:
+            keyboard = [
+                [InlineKeyboardButton(text="📷 Фото", callback_data="select_media_photo")],
+                [InlineKeyboardButton(text="🎥 Видео", callback_data="select_media_video")],
+                [InlineKeyboardButton(text="📄 Документ", callback_data="select_media_document")],
+                [InlineKeyboardButton(text="✅ Без медиа", callback_data="skip_media")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task")]
+            ]
+
+            text = (
+                f"✅ Число месяца: {monthday_label}\n\n"
+                "Шаг 6/7: Выберите тип медиа (или пропустите):"
+            )
+
+            if isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.message.edit_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+                )
+                await message_or_callback.answer()
+            else:
+                await safe_reply(
+                    message_or_callback,
+                    text,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+                )
+            await state.set_state(TaskCreationStates.waiting_for_media_type)
+
+        # Ввод числа месяца вручную
+        @dp.callback_query(F.data == "enter_monthday_manual", StateFilter(TaskCreationStates.waiting_for_monthday))
+        @admin_only
+        async def enter_monthday_manual_callback(callback: CallbackQuery, state: FSMContext) -> None:
+            await callback.message.edit_text(
+                "🔢 Введите число месяца (1-31) или 'любое' для пропуска:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task")
+                ]])
+            )
+            await callback.answer()
+
+        @dp.message(StateFilter(TaskCreationStates.waiting_for_monthday))
+        @admin_only
+        async def process_monthday_input(message: Message, state: FSMContext) -> None:
+            if not message.text:
+                await safe_reply(
+                    message,
+                    "❌ Пожалуйста, отправьте число месяца (1-31).",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                return
+
+            input_text = message.text.strip().lower()
+            if input_text in {"любое", "любой", "any", "all", "*", "-"}:
+                await state.update_data(monthday=None)
+                await prompt_media_type_after_monthday(message, state, "любое")
+                return
+
+            try:
+                monthday = parse_monthday(input_text)
+            except ValueError as exc:
+                await safe_reply(
+                    message,
+                    f"❌ Ошибка: {exc}",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                return
+
+            await state.update_data(monthday=monthday)
+            await prompt_media_type_after_monthday(message, state, str(monthday))
+
         # Пропуск дней недели
         @dp.callback_query(F.data == "skip_weekdays", StateFilter(TaskCreationStates.waiting_for_weekdays))
         @admin_only
@@ -1230,46 +1492,14 @@ async def main() -> None:
         async def select_monthday_callback(callback: CallbackQuery, state: FSMContext) -> None:
             monthday = int(callback.data.replace("select_monthday_", ""))
             await state.update_data(monthday=monthday)
-            
-            # Показываем клавиатуру для выбора типа медиа
-            keyboard = [
-                [InlineKeyboardButton(text="📷 Фото", callback_data="select_media_photo")],
-                [InlineKeyboardButton(text="🎥 Видео", callback_data="select_media_video")],
-                [InlineKeyboardButton(text="📄 Документ", callback_data="select_media_document")],
-                [InlineKeyboardButton(text="✅ Без медиа", callback_data="skip_media")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task")]
-            ]
-            
-            await callback.message.edit_text(
-                f"✅ Число месяца: {monthday}\n\n"
-                f"Шаг 6/7: Выберите тип медиа (или пропустите):",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-            )
-            await callback.answer()
-            await state.set_state(TaskCreationStates.waiting_for_media_type)
+            await prompt_media_type_after_monthday(callback, state, str(monthday))
 
         # Пропуск числа месяца
         @dp.callback_query(F.data == "skip_monthday", StateFilter(TaskCreationStates.waiting_for_monthday))
         @admin_only
         async def skip_monthday_callback(callback: CallbackQuery, state: FSMContext) -> None:
             await state.update_data(monthday=None)
-            
-            # Показываем клавиатуру для выбора типа медиа
-            keyboard = [
-                [InlineKeyboardButton(text="📷 Фото", callback_data="select_media_photo")],
-                [InlineKeyboardButton(text="🎥 Видео", callback_data="select_media_video")],
-                [InlineKeyboardButton(text="📄 Документ", callback_data="select_media_document")],
-                [InlineKeyboardButton(text="✅ Без медиа", callback_data="skip_media")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task")]
-            ]
-            
-            await callback.message.edit_text(
-                f"✅ Число месяца: любое\n\n"
-                f"Шаг 6/7: Выберите тип медиа (или пропустите):",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-            )
-            await callback.answer()
-            await state.set_state(TaskCreationStates.waiting_for_media_type)
+            await prompt_media_type_after_monthday(callback, state, "любое")
 
         # Обработчик выбора типа медиа
         @dp.callback_query(F.data.startswith("select_media_"), StateFilter(TaskCreationStates.waiting_for_media_type))
@@ -1280,7 +1510,7 @@ async def main() -> None:
             
             await callback.message.edit_text(
                 f"✅ Тип медиа: {media_type}\n\n"
-                f"Шаг 7/7: Введите URL медиафайла или file_id Telegram:",
+                "Шаг 7/7: Отправьте медиафайл или введите его URL/file_id:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_task")
                 ]])
@@ -1335,26 +1565,28 @@ async def main() -> None:
         @dp.message(StateFilter(TaskCreationStates.waiting_for_media_url))
         @admin_only
         async def process_media_url_input(message: Message, state: FSMContext) -> None:
-            # Проверяем, что это текстовое сообщение
-            if not message.text:
+            data = await state.get_data()
+            media_type = data.get("media_type")
+            media_url: Optional[str] = None
+
+            if media_type == "photo" and message.photo:
+                media_url = message.photo[-1].file_id
+            elif media_type == "video" and message.video:
+                media_url = message.video.file_id
+            elif media_type == "document" and message.document:
+                media_url = message.document.file_id
+            elif message.text:
+                media_url = message.text.strip()
+
+            if not media_url:
                 await safe_reply(
                     message,
-                    "❌ Пожалуйста, отправьте текстовое сообщение с URL медиафайла.\n\n"
+                    "❌ Пожалуйста, отправьте медиафайл выбранного типа или укажите URL/file_id.\n\n"
                     "Или отправьте /cancel для отмены.",
                     reply_markup=ReplyKeyboardRemove()
                 )
                 return
-            
-            media_url = message.text.strip()
-            if not media_url:
-                await safe_reply(
-                    message,
-                    "❌ URL не может быть пустым.\n\n"
-                    "Попробуйте еще раз или отправьте /cancel для отмены.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-                return
-            
+
             await state.update_data(media_url=media_url)
             await confirm_task(message, state)
 
@@ -1523,13 +1755,13 @@ async def main() -> None:
                     # Проверяем: начинается с "-" ИЛИ это число длиннее 8 цифр (не может быть числом месяца)
                     if (word.startswith("-") and word[1:].isdigit()) or (word.isdigit() and len(word) > 8):
                         try:
-                            test_id = int(word)
+                            int(word)
                             target_chat_id = word
                             used_indices.add(i)
                             logger.info("Detected chat_id parameter: %s", target_chat_id)
                             break
                         except ValueError:
-                            pass
+                            continue
                 
                 # Ищем дни недели (может содержать запятые)
                 for i, word in enumerate(words):
@@ -1541,8 +1773,8 @@ async def main() -> None:
                             weekdays = parse_weekdays(word)
                             used_indices.add(i)
                             break
-                        except:
-                            pass
+                        except ValueError:
+                            continue
                 
                 # Ищем число месяца (1-31)
                 for i, word in enumerate(words):
@@ -1554,8 +1786,8 @@ async def main() -> None:
                             monthday = num
                             used_indices.add(i)
                             break
-                    except:
-                        pass
+                    except ValueError:
+                        continue
                 
                 # Ищем тип медиа и URL
                 for i, word in enumerate(words):
@@ -1575,11 +1807,15 @@ async def main() -> None:
                 message_text = " ".join(message_words)
                 
                 if not message_text:
-                    await message.reply("❌ Укажите текст сообщения")
+                    await safe_reply(message, "❌ Укажите текст сообщения", reply_markup=get_main_menu_keyboard())
                     return
 
                 if media_type and not media_url:
-                    await message.reply("❌ Укажите ссылку на медиа после типа (photo/video/document)")
+                    await safe_reply(
+                        message,
+                        "❌ Укажите ссылку на медиа после типа (photo/video/document)",
+                        reply_markup=get_main_menu_keyboard()
+                    )
                     return
 
                 if media_type:
@@ -1610,7 +1846,8 @@ async def main() -> None:
                 safe_task_id = escape(task_id)
                 safe_message = escape(message_text)
                 safe_media_str = escape(media_str)
-                await message.reply(
+                await safe_reply(
+                    message,
                     f"✅ Задача добавлена!\n\n"
                     f"📋 ID задачи: <code>{safe_task_id}</code>\n"
                     f"💬 Чат: {target_chat_id}{chat_info}\n"
@@ -1619,7 +1856,8 @@ async def main() -> None:
                     f"📅 Дни недели: {weekday_str}\n"
                     f"🔢 Число месяца: {monthday_str}\n"
                     f"📎 Медиа: {safe_media_str}",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=get_main_menu_keyboard()
                 )
             except ValueError as e:
                 await safe_reply(message, f"❌ Ошибка: {e}", reply_markup=get_main_menu_keyboard())
@@ -1627,8 +1865,51 @@ async def main() -> None:
                 logger.exception("Error adding task")
                 await safe_reply(message, f"❌ Произошла ошибка: {e}", reply_markup=get_main_menu_keyboard())
 
+        LIST_TASKS_PAGE_SIZE = 20
+
+        def build_list_tasks_page(tasks: List[Task], offset: int, is_admin: bool) -> Tuple[str, InlineKeyboardMarkup]:
+            total_tasks = len(tasks)
+            end_index = min(offset + LIST_TASKS_PAGE_SIZE, total_tasks)
+            page_tasks = tasks[offset:end_index]
+
+            text = "📋 Список всех задач (админ-режим):\n\n" if is_admin else "📋 Список задач:\n\n"
+            text += f"Показаны задачи {offset + 1}-{end_index} из {total_tasks}.\n\n"
+
+            for i, task in enumerate(page_tasks, offset + 1):
+                status = "✅" if task.enabled else "❌"
+                weekday_str = ", ".join(task.weekdays) if task.weekdays else "любые"
+                monthday_str = str(task.monthday) if task.monthday else "любое"
+                media_str = f"{task.media_type}" if task.media_type else "нет"
+                chat_info = f" (чат: {task.chat_id})" if is_admin else ""
+
+                safe_task_id = escape(task.task_id)
+                safe_message = escape(task.message[:30])
+                safe_media_str = escape(media_str)
+
+                text += f"{status} <b>{i}.</b> ID: <code>{safe_task_id}</code>{chat_info}\n"
+                text += f"   Время: {task.time_str}\n"
+                text += f"   Сообщение: {safe_message}...\n"
+                text += f"   Дни: {weekday_str}, Число: {monthday_str}\n"
+                text += f"   Медиа: {safe_media_str}\n\n"
+
+            keyboard: List[List[InlineKeyboardButton]] = []
+            navigation = []
+            if offset > 0:
+                navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="list_tasks_prev"))
+            remaining = total_tasks - end_index
+            if remaining > 0:
+                navigation.append(InlineKeyboardButton(
+                    text=f"Показать еще ({remaining})",
+                    callback_data="list_tasks_more"
+                ))
+            if navigation:
+                keyboard.append(navigation)
+
+            keyboard.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="list_tasks_close")])
+            return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
         @dp.message(Command("list_tasks"))
-        async def list_tasks_handler(message: Message) -> None:
+        async def list_tasks_handler(message: Message, state: FSMContext) -> None:
             user_id = message.from_user.id if message.from_user else None
             if not user_id or not admin_manager.is_admin(user_id):
                 await safe_reply(message, "❌ У вас нет прав администратора для выполнения этой команды.", reply_markup=get_main_menu_keyboard())
@@ -1642,41 +1923,61 @@ async def main() -> None:
                 )
                 return
 
-            # Админы видят все задачи, остальные - только для своего чата
             is_admin = admin_manager.is_admin(user_id)
-            
+
             if is_admin:
                 chat_tasks = tasks
-                text = "📋 Список всех задач (админ-режим):\n\n"
             else:
                 chat_tasks = [t for t in tasks if t.chat_id == str(message.chat.id)]
                 if not chat_tasks:
-                    await message.reply(
+                    await safe_reply(
+                        message,
                         "📋 Для этого чата задач нет.",
                         reply_markup=get_main_menu_keyboard()
                     )
                     return
-                text = "📋 Список задач:\n\n"
-            
-            for i, task in enumerate(chat_tasks, 1):
-                status = "✅" if task.enabled else "❌"
-                weekday_str = ", ".join(task.weekdays) if task.weekdays else "любые"
-                monthday_str = str(task.monthday) if task.monthday else "любое"
-                media_str = f"{task.media_type}" if task.media_type else "нет"
-                chat_info = f" (чат: {task.chat_id})" if is_admin else ""
-                
-                # Экранируем все специальные символы
-                safe_task_id = escape(task.task_id)
-                safe_message = escape(task.message[:30])
-                safe_media_str = escape(media_str)
-                
-                text += f"{status} <b>{i}.</b> ID: <code>{safe_task_id}</code>{chat_info}\n"
-                text += f"   Время: {task.time_str}\n"
-                text += f"   Сообщение: {safe_message}...\n"
-                text += f"   Дни: {weekday_str}, Число: {monthday_str}\n"
-                text += f"   Медиа: {safe_media_str}\n\n"
 
-            await safe_reply(message, text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+            await state.update_data(list_tasks_offset=0)
+            text, markup = build_list_tasks_page(chat_tasks, 0, is_admin)
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.callback_query(F.data.startswith("list_tasks_"))
+        @admin_only
+        async def list_tasks_navigation_callback(callback: CallbackQuery, state: FSMContext, **kwargs) -> None:
+            action = callback.data.replace("list_tasks_", "")
+            if action == "close":
+                await callback.message.edit_text("📋 Список задач закрыт.")
+                await callback.answer()
+                return
+
+            tasks = storage.get_all_tasks()
+            if not tasks:
+                await callback.answer("📋 Задач пока нет.", show_alert=True)
+                return
+
+            is_admin = admin_manager.is_admin(callback.from_user.id)
+            if is_admin:
+                chat_tasks = tasks
+            else:
+                chat_tasks = [t for t in tasks if t.chat_id == str(callback.message.chat.id)]
+                if not chat_tasks:
+                    await callback.answer("📋 Для этого чата задач нет.", show_alert=True)
+                    return
+
+            data = await state.get_data()
+            offset = data.get("list_tasks_offset", 0)
+            if action == "more":
+                offset += LIST_TASKS_PAGE_SIZE
+            elif action == "prev":
+                offset -= LIST_TASKS_PAGE_SIZE
+
+            max_offset = ((len(chat_tasks) - 1) // LIST_TASKS_PAGE_SIZE) * LIST_TASKS_PAGE_SIZE
+            offset = max(0, min(offset, max_offset))
+            await state.update_data(list_tasks_offset=offset)
+
+            text, markup = build_list_tasks_page(chat_tasks, offset, is_admin)
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            await callback.answer()
 
         # Вспомогательная функция для показа списка задач для удаления
         async def show_delete_task_list(message: Message, state: FSMContext) -> None:
@@ -1688,7 +1989,8 @@ async def main() -> None:
             
             tasks = storage.get_all_tasks()
             if not tasks:
-                await message.reply(
+                await safe_reply(
+                    message,
                     "📋 Задач пока нет. Используйте /add_task для добавления.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -1702,7 +2004,8 @@ async def main() -> None:
             else:
                 chat_tasks = [t for t in tasks if t.chat_id == str(message.chat.id)]
                 if not chat_tasks:
-                    await message.reply(
+                    await safe_reply(
+                        message,
                         "📋 Для этого чата задач нет.",
                         reply_markup=get_main_menu_keyboard()
                     )
@@ -1768,20 +2071,20 @@ async def main() -> None:
             # Если это длинный task_id, возвращаем как есть
             return callback_prefix
 
-        @dp.message(Command("edit_task"))
-        @admin_only
-        async def edit_task_handler(message: Message) -> None:
-            tasks = storage.get_all_tasks()
-            if not tasks:
-                await message.reply("📋 Задач пока нет. Используйте /add_task для добавления.")
-                return
-            
-            # Показываем список задач с кнопками для редактирования
+        EDIT_TASK_PAGE_SIZE = 20
+
+        def build_edit_task_page(tasks: List[Task], offset: int) -> Tuple[str, InlineKeyboardMarkup]:
+            total_tasks = len(tasks)
+            end_index = min(offset + EDIT_TASK_PAGE_SIZE, total_tasks)
+            page_tasks = tasks[offset:end_index]
+
             keyboard = []
             import hashlib
-            for i, task in enumerate(tasks[:20], 1):  # Ограничиваем 20 задач
+            for i, task in enumerate(page_tasks, offset + 1):
                 chat_title = chat_storage.get_chat_title(task.chat_id)
-                task_preview = f"{i}. {task.time_str} - {task.message[:30]}... ({chat_title})"
+                message_preview = task.message[:30]
+                preview_suffix = "..." if len(task.message) > 30 else ""
+                task_preview = f"{i}. {task.time_str} - {message_preview}{preview_suffix} ({chat_title})"
                 # Используем хеш если task_id слишком длинный
                 if len(task.task_id) > 40:
                     task_id_hash = hashlib.md5(task.task_id.encode()).hexdigest()[:16]
@@ -1792,22 +2095,88 @@ async def main() -> None:
                     text=task_preview,
                     callback_data=callback_data
                 )])
-            
-            if len(tasks) > 20:
-                keyboard.append([InlineKeyboardButton(
-                    text=f"Показать еще ({len(tasks) - 20})",
+
+            navigation = []
+            if offset > 0:
+                navigation.append(InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="edit_task_prev"
+                ))
+            remaining = total_tasks - end_index
+            if remaining > 0:
+                navigation.append(InlineKeyboardButton(
+                    text=f"Показать еще ({remaining})",
                     callback_data="edit_task_more"
-                )])
-            
+                ))
+            if navigation:
+                keyboard.append(navigation)
+
             keyboard.append([InlineKeyboardButton(
                 text="❌ Отмена",
                 callback_data="cancel_edit"
             )])
-            
-            await message.reply(
+
+            page_text = (
                 "📝 <b>Редактирование задач</b>\n\n"
-                "Выберите задачу для редактирования:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+                f"Показаны задачи {offset + 1}-{end_index} из {total_tasks}.\n"
+                "Выберите задачу для редактирования:"
+            )
+            return page_text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+        def build_task_edit_view(task: Task, callback_prefix: str) -> Tuple[str, InlineKeyboardMarkup]:
+            chat_title = chat_storage.get_chat_title(task.chat_id)
+            weekday_str = ", ".join(task.weekdays) if task.weekdays else "каждый день"
+            monthday_str = str(task.monthday) if task.monthday else "любое"
+            media_str = f"{task.media_type}: {task.media_url}" if task.media_type else "нет"
+
+            safe_task_id = escape(task.task_id)
+            safe_chat_title = escape(chat_title)
+            safe_message = escape(task.message[:200])
+            safe_media_str = escape(media_str)
+
+            keyboard = [
+                [InlineKeyboardButton(text="✏️ Изменить время", callback_data=f"edit_field_{callback_prefix}_time")],
+                [InlineKeyboardButton(text="✏️ Изменить сообщение", callback_data=f"edit_field_{callback_prefix}_message")],
+                [InlineKeyboardButton(text="✏️ Изменить дни недели", callback_data=f"edit_field_{callback_prefix}_weekdays")],
+                [InlineKeyboardButton(text="✏️ Изменить число месяца", callback_data=f"edit_field_{callback_prefix}_monthday")],
+                [InlineKeyboardButton(text="✏️ Изменить медиа", callback_data=f"edit_field_{callback_prefix}_media")],
+                [InlineKeyboardButton(text="🔄 Включить/Выключить", callback_data=f"toggle_task_{callback_prefix}")],
+                [InlineKeyboardButton(text="🗑️ Удалить задачу", callback_data=f"delete_task_confirm_{callback_prefix}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]
+            ]
+
+            text = (
+                "📝 <b>Редактирование задачи</b>\n\n"
+                f"📋 ID: <code>{safe_task_id}</code>\n"
+                f"💬 Чат: {safe_chat_title}\n"
+                f"⏰ Время: {task.time_str}\n"
+                f"📝 Сообщение: {safe_message}{'...' if len(task.message) > 200 else ''}\n"
+                f"📅 Дни недели: {weekday_str}\n"
+                f"🔢 Число месяца: {monthday_str}\n"
+                f"📎 Медиа: {safe_media_str}\n"
+                f"✅ Статус: {'активна' if task.enabled else 'неактивна'}\n\n"
+                "Что хотите изменить?"
+            )
+            return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+        @dp.message(Command("edit_task"))
+        @admin_only
+        async def edit_task_handler(message: Message, state: FSMContext) -> None:
+            tasks = storage.get_all_tasks()
+            if not tasks:
+                await safe_reply(
+                    message,
+                    "📋 Задач пока нет. Используйте /add_task для добавления.",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                return
+
+            await state.update_data(edit_task_offset=0)
+            page_text, markup = build_edit_task_page(tasks, 0)
+
+            await safe_reply(
+                page_text,
+                reply_markup=markup,
                 parse_mode="HTML"
             )
 
@@ -1817,11 +2186,34 @@ async def main() -> None:
         async def edit_task_select_callback(callback: CallbackQuery, state: FSMContext, **kwargs) -> None:
             callback_prefix = callback.data.replace("edit_task_", "")
             
-            if callback_prefix == "more":
-                await callback.answer("Функция 'Показать еще' в разработке")
+            if callback_prefix in {"more", "prev"}:
+                tasks = storage.get_all_tasks()
+                if not tasks:
+                    await callback.answer("📋 Задач пока нет.", show_alert=True)
+                    return
+
+                data = await state.get_data()
+                offset = data.get("edit_task_offset", 0)
+                if callback_prefix == "more":
+                    offset += EDIT_TASK_PAGE_SIZE
+                else:
+                    offset -= EDIT_TASK_PAGE_SIZE
+
+                max_offset = ((len(tasks) - 1) // EDIT_TASK_PAGE_SIZE) * EDIT_TASK_PAGE_SIZE
+                offset = max(0, min(offset, max_offset))
+                await state.update_data(edit_task_offset=offset)
+
+                page_text, markup = build_edit_task_page(tasks, offset)
+                await callback.message.edit_text(
+                    page_text,
+                    reply_markup=markup,
+                    parse_mode="HTML"
+                )
+                await callback.answer()
                 return
             
             # Получаем реальный task_id
+            await state.clear()
             task_id = await get_real_task_id(callback_prefix, state)
             task = storage.get_task(task_id)
             if not task:
@@ -1831,17 +2223,6 @@ async def main() -> None:
             # Если использовался хеш, сохраняем соответствие в состоянии
             if len(callback_prefix) == 16 and len(task_id) > 40:
                 await state.update_data(task_id_hash=callback_prefix, real_task_id=task_id)
-            
-            chat_title = chat_storage.get_chat_title(task.chat_id)
-            weekday_str = ", ".join(task.weekdays) if task.weekdays else "каждый день"
-            monthday_str = str(task.monthday) if task.monthday else "любое"
-            media_str = f"{task.media_type}: {task.media_url}" if task.media_type else "нет"
-            
-            # Экранируем HTML символы в тексте
-            safe_task_id = escape(task_id)
-            safe_chat_title = escape(chat_title)
-            safe_message = escape(task.message[:200])  # Ограничиваем длину для безопасности
-            safe_media_str = escape(media_str)
             
             # Проверяем длину callback_data (Telegram ограничивает до 64 байт)
             # Используем хеш task_id если он слишком длинный
@@ -1853,30 +2234,13 @@ async def main() -> None:
                 await state.update_data(task_id_hash=callback_prefix, real_task_id=task_id)
             else:
                 callback_prefix = task_id
-            
-            keyboard = [
-                [InlineKeyboardButton(text="✏️ Изменить время", callback_data=f"edit_field_{callback_prefix}_time")],
-                [InlineKeyboardButton(text="✏️ Изменить сообщение", callback_data=f"edit_field_{callback_prefix}_message")],
-                [InlineKeyboardButton(text="✏️ Изменить дни недели", callback_data=f"edit_field_{callback_prefix}_weekdays")],
-                [InlineKeyboardButton(text="✏️ Изменить число месяца", callback_data=f"edit_field_{callback_prefix}_monthday")],
-                [InlineKeyboardButton(text="✏️ Изменить медиа", callback_data=f"edit_field_{callback_prefix}_media")],
-                [InlineKeyboardButton(text="🔄 Включить/Выключить", callback_data=f"toggle_task_{callback_prefix}")],
-                [InlineKeyboardButton(text="🗑️ Удалить задачу", callback_data=f"delete_task_confirm_{callback_prefix}")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]
-            ]
-            
+
+            await state.update_data(edit_task_id=task_id, edit_task_prefix=callback_prefix)
+
+            text, markup = build_task_edit_view(task, callback_prefix)
             await callback.message.edit_text(
-                f"📝 <b>Редактирование задачи</b>\n\n"
-                f"📋 ID: <code>{safe_task_id}</code>\n"
-                f"💬 Чат: {safe_chat_title}\n"
-                f"⏰ Время: {task.time_str}\n"
-                f"📝 Сообщение: {safe_message}{'...' if len(task.message) > 200 else ''}\n"
-                f"📅 Дни недели: {weekday_str}\n"
-                f"🔢 Число месяца: {monthday_str}\n"
-                f"📎 Медиа: {safe_media_str}\n"
-                f"✅ Статус: {'активна' if task.enabled else 'неактивна'}\n\n"
-                f"Что хотите изменить?",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+                text,
+                reply_markup=markup,
                 parse_mode="HTML"
             )
             await callback.answer()
@@ -1884,7 +2248,8 @@ async def main() -> None:
         # Обработчик отмены редактирования
         @dp.callback_query(F.data == "cancel_edit")
         @admin_only
-        async def cancel_edit_callback(callback: CallbackQuery) -> None:
+        async def cancel_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+            await state.clear()
             await callback.message.edit_text("❌ Редактирование отменено.")
             await callback.answer()
 
@@ -1906,43 +2271,257 @@ async def main() -> None:
             status = "активна" if task.enabled else "неактивна"
             await callback.answer(f"✅ Задача теперь {status}")
             
-            # Обновляем сообщение
-            chat_title = chat_storage.get_chat_title(task.chat_id)
-            weekday_str = ", ".join(task.weekdays) if task.weekdays else "каждый день"
-            monthday_str = str(task.monthday) if task.monthday else "любое"
-            media_str = f"{task.media_type}: {task.media_url}" if task.media_type else "нет"
-            
-            safe_task_id = escape(task_id)
-            safe_chat_title = escape(chat_title)
-            safe_message = escape(task.message[:200])
-            safe_media_str = escape(media_str)
-            
-            # Используем тот же callback_prefix для кнопок
-            keyboard = [
-                [InlineKeyboardButton(text="✏️ Изменить время", callback_data=f"edit_field_{callback_prefix}_time")],
-                [InlineKeyboardButton(text="✏️ Изменить сообщение", callback_data=f"edit_field_{callback_prefix}_message")],
-                [InlineKeyboardButton(text="✏️ Изменить дни недели", callback_data=f"edit_field_{callback_prefix}_weekdays")],
-                [InlineKeyboardButton(text="✏️ Изменить число месяца", callback_data=f"edit_field_{callback_prefix}_monthday")],
-                [InlineKeyboardButton(text="✏️ Изменить медиа", callback_data=f"edit_field_{callback_prefix}_media")],
-                [InlineKeyboardButton(text="🔄 Включить/Выключить", callback_data=f"toggle_task_{callback_prefix}")],
-                [InlineKeyboardButton(text="🗑️ Удалить задачу", callback_data=f"delete_task_confirm_{callback_prefix}")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]
-            ]
-            
+            text, markup = build_task_edit_view(task, callback_prefix)
             await callback.message.edit_text(
-                f"📝 <b>Редактирование задачи</b>\n\n"
-                f"📋 ID: <code>{safe_task_id}</code>\n"
-                f"💬 Чат: {safe_chat_title}\n"
-                f"⏰ Время: {task.time_str}\n"
-                f"📝 Сообщение: {safe_message}{'...' if len(task.message) > 200 else ''}\n"
-                f"📅 Дни недели: {weekday_str}\n"
-                f"🔢 Число месяца: {monthday_str}\n"
-                f"📎 Медиа: {safe_media_str}\n"
-                f"✅ Статус: {'активна' if task.enabled else 'неактивна'}\n\n"
-                f"Что хотите изменить?",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+                text,
+                reply_markup=markup,
                 parse_mode="HTML"
             )
+
+        def build_edit_prompt_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+            return InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"edit_task_{callback_prefix}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]
+            ])
+
+        def parse_optional_weekdays_input(value: str) -> Optional[List[str]]:
+            normalized = value.strip().lower()
+            if normalized in {"", "любой", "любые", "каждый", "каждый день", "any", "all", "*", "-"}:
+                return None
+            return parse_weekdays(value)
+
+        def parse_optional_monthday_input(value: str) -> Optional[int]:
+            normalized = value.strip().lower()
+            if normalized in {"", "любой", "любые", "каждый", "каждый день", "any", "all", "*", "-"}:
+                return None
+            return parse_monthday(value)
+
+        @dp.callback_query(F.data.startswith("edit_field_"))
+        @admin_only
+        async def edit_field_callback(callback: CallbackQuery, state: FSMContext, **kwargs) -> None:
+            payload = callback.data.replace("edit_field_", "")
+            if "_" not in payload:
+                await callback.answer("❌ Некорректный формат команды.", show_alert=True)
+                return
+
+            callback_prefix, field = payload.rsplit("_", 1)
+            task_id = await get_real_task_id(callback_prefix, state)
+            task = storage.get_task(task_id)
+            if not task:
+                await callback.answer("❌ Задача не найдена", show_alert=True)
+                return
+
+            await state.update_data(edit_task_id=task_id, edit_task_prefix=callback_prefix)
+
+            if field == "time":
+                await callback.message.edit_text(
+                    "⏰ Введите новое время в формате HH:MM (например, 09:30):",
+                    reply_markup=build_edit_prompt_keyboard(callback_prefix)
+                )
+                await state.set_state(EditTaskStates.waiting_for_time)
+            elif field == "message":
+                await callback.message.edit_text(
+                    "📝 Введите новое сообщение для задачи:",
+                    reply_markup=build_edit_prompt_keyboard(callback_prefix)
+                )
+                await state.set_state(EditTaskStates.waiting_for_message)
+            elif field == "weekdays":
+                await callback.message.edit_text(
+                    "📅 Введите дни недели через запятую (например: пн,ср,пт) или 'любые' для снятия ограничения:",
+                    reply_markup=build_edit_prompt_keyboard(callback_prefix)
+                )
+                await state.set_state(EditTaskStates.waiting_for_weekdays)
+            elif field == "monthday":
+                await callback.message.edit_text(
+                    "🔢 Введите число месяца (1-31) или 'любое' для снятия ограничения:",
+                    reply_markup=build_edit_prompt_keyboard(callback_prefix)
+                )
+                await state.set_state(EditTaskStates.waiting_for_monthday)
+            elif field == "media":
+                await callback.message.edit_text(
+                    "📎 Отправьте фото/видео/документ, укажите URL/file_id, или напишите 'нет' для удаления медиа:",
+                    reply_markup=build_edit_prompt_keyboard(callback_prefix)
+                )
+                await state.set_state(EditTaskStates.waiting_for_media)
+            else:
+                await callback.answer("❌ Неизвестное поле.", show_alert=True)
+                return
+
+            await callback.answer()
+
+        @dp.message(StateFilter(EditTaskStates.waiting_for_time))
+        @admin_only
+        async def edit_time_input(message: Message, state: FSMContext) -> None:
+            if not message.text:
+                await safe_reply(message, "❌ Введите время в формате HH:MM.")
+                return
+            value = message.text.strip()
+            try:
+                parse_time(value)
+            except ValueError as exc:
+                await safe_reply(message, f"❌ Ошибка: {exc}")
+                return
+
+            data = await state.get_data()
+            task_id = data.get("edit_task_id")
+            callback_prefix = data.get("edit_task_prefix", task_id)
+            task = storage.get_task(task_id)
+            if not task:
+                await safe_reply(message, "❌ Задача не найдена.")
+                await state.clear()
+                return
+
+            task.time_str = value
+            storage.add_task(task)
+            await scheduler.refresh_jobs()
+            await state.clear()
+
+            text, markup = build_task_edit_view(task, callback_prefix)
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.message(StateFilter(EditTaskStates.waiting_for_message))
+        @admin_only
+        async def edit_message_input(message: Message, state: FSMContext) -> None:
+            if not message.text or not message.text.strip():
+                await safe_reply(message, "❌ Сообщение не может быть пустым.")
+                return
+            value = message.text.strip()
+
+            data = await state.get_data()
+            task_id = data.get("edit_task_id")
+            callback_prefix = data.get("edit_task_prefix", task_id)
+            task = storage.get_task(task_id)
+            if not task:
+                await safe_reply(message, "❌ Задача не найдена.")
+                await state.clear()
+                return
+
+            task.message = value
+            storage.add_task(task)
+            await scheduler.refresh_jobs()
+            await state.clear()
+
+            text, markup = build_task_edit_view(task, callback_prefix)
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.message(StateFilter(EditTaskStates.waiting_for_weekdays))
+        @admin_only
+        async def edit_weekdays_input(message: Message, state: FSMContext) -> None:
+            if not message.text:
+                await safe_reply(message, "❌ Введите дни недели или 'любые'.")
+                return
+            value = message.text.strip()
+            try:
+                weekdays = parse_optional_weekdays_input(value)
+            except ValueError as exc:
+                await safe_reply(message, f"❌ Ошибка: {exc}")
+                return
+
+            data = await state.get_data()
+            task_id = data.get("edit_task_id")
+            callback_prefix = data.get("edit_task_prefix", task_id)
+            task = storage.get_task(task_id)
+            if not task:
+                await safe_reply(message, "❌ Задача не найдена.")
+                await state.clear()
+                return
+
+            task.weekdays = weekdays
+            storage.add_task(task)
+            await scheduler.refresh_jobs()
+            await state.clear()
+
+            text, markup = build_task_edit_view(task, callback_prefix)
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.message(StateFilter(EditTaskStates.waiting_for_monthday))
+        @admin_only
+        async def edit_monthday_input(message: Message, state: FSMContext) -> None:
+            if not message.text:
+                await safe_reply(message, "❌ Введите число месяца или 'любое'.")
+                return
+            value = message.text.strip()
+            try:
+                monthday = parse_optional_monthday_input(value)
+            except ValueError as exc:
+                await safe_reply(message, f"❌ Ошибка: {exc}")
+                return
+
+            data = await state.get_data()
+            task_id = data.get("edit_task_id")
+            callback_prefix = data.get("edit_task_prefix", task_id)
+            task = storage.get_task(task_id)
+            if not task:
+                await safe_reply(message, "❌ Задача не найдена.")
+                await state.clear()
+                return
+
+            task.monthday = monthday
+            storage.add_task(task)
+            await scheduler.refresh_jobs()
+            await state.clear()
+
+            text, markup = build_task_edit_view(task, callback_prefix)
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
+
+        @dp.message(StateFilter(EditTaskStates.waiting_for_media))
+        @admin_only
+        async def edit_media_input(message: Message, state: FSMContext) -> None:
+            data = await state.get_data()
+            task_id = data.get("edit_task_id")
+            callback_prefix = data.get("edit_task_prefix", task_id)
+            task = storage.get_task(task_id)
+            if not task:
+                await safe_reply(message, "❌ Задача не найдена.")
+                await state.clear()
+                return
+
+            media_type: Optional[str] = None
+            media_url: Optional[str] = None
+            if message.photo:
+                media_type = "photo"
+                media_url = message.photo[-1].file_id
+            elif message.video:
+                media_type = "video"
+                media_url = message.video.file_id
+            elif message.document:
+                media_type = "document"
+                media_url = message.document.file_id
+            elif message.text:
+                text = message.text.strip()
+                if text.lower() in {"нет", "без", "удалить", "remove"}:
+                    media_type = None
+                    media_url = None
+                else:
+                    parts = text.split(maxsplit=1)
+                    if parts[0].lower() in MEDIA_SENDERS and len(parts) > 1:
+                        media_type = parts[0].lower()
+                        media_url = parts[1].strip()
+                    elif task.media_type:
+                        media_type = task.media_type
+                        media_url = text
+                    else:
+                        await safe_reply(
+                            message,
+                            "❌ Укажите тип медиа: photo <URL>, video <URL>, document <URL>, "
+                            "или отправьте файл напрямую."
+                        )
+                        return
+
+            try:
+                parse_media(media_type, media_url)
+            except ValueError as exc:
+                await safe_reply(message, f"❌ Ошибка: {exc}")
+                return
+
+            task.media_type = media_type
+            task.media_url = media_url
+            storage.add_task(task)
+            await scheduler.refresh_jobs()
+            await state.clear()
+
+            text, markup = build_task_edit_view(task, callback_prefix)
+            await safe_reply(message, text, parse_mode="HTML", reply_markup=markup)
 
         # Обработчик подтверждения удаления задачи
         @dp.callback_query(F.data.startswith("delete_task_confirm_"))
@@ -1998,7 +2577,7 @@ async def main() -> None:
                 else:
                     parts = message.text.split(maxsplit=1)
                     if len(parts) < 2:
-                        await message.reply(
+                        await safe_reply(
                             "❌ Укажите ID пользователя или ответьте на сообщение пользователя.\n"
                             "Пример: /add_admin 123456789",
                             reply_markup=get_main_menu_keyboard()
@@ -2024,7 +2603,7 @@ async def main() -> None:
             try:
                 parts = message.text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await message.reply(
+                    await safe_reply(
                         "❌ Укажите ID пользователя.\n"
                         "Пример: /remove_admin 123456789",
                         reply_markup=get_main_menu_keyboard()
@@ -2075,7 +2654,15 @@ async def main() -> None:
                 await state.clear()
                 # Не показываем сообщение об отмене, чтобы не мешать пользователю
             # Перенаправляем на существующий обработчик
-            await list_tasks_handler(message)
+            await list_tasks_handler(message, state)
+
+        @dp.message(F.text == "🧹 Удалить чат")
+        @admin_only
+        async def menu_remove_chat_handler(message: Message, state: FSMContext, **kwargs) -> None:
+            current_state = await state.get_state()
+            if current_state:
+                await state.clear()
+            await remove_chat_handler(message)
         
         @dp.message(F.text == "➕ Добавить задачу")
         @admin_only
@@ -2097,7 +2684,7 @@ async def main() -> None:
                 await state.clear()
                 # Не показываем сообщение об отмене, чтобы не мешать пользователю
             # Перенаправляем на существующий обработчик
-            await edit_task_handler(message)
+            await edit_task_handler(message, state)
         
         @dp.message(F.text == "🗑️ Удалить задачу")
         @admin_only
@@ -2116,7 +2703,7 @@ async def main() -> None:
         async def process_delete_task_number(message: Message, state: FSMContext, **kwargs) -> None:
             # Проверяем, что это текстовое сообщение
             if not message.text:
-                await message.reply(
+                await safe_reply(
                     "❌ Пожалуйста, отправьте текстовое сообщение с номером задачи.\n\n"
                     "Или отправьте /cancel для отмены.",
                     reply_markup=ReplyKeyboardRemove()
@@ -2127,7 +2714,7 @@ async def main() -> None:
             
             # Проверяем команду отмены
             if input_text.lower() in ['/cancel', 'отмена', 'cancel']:
-                await message.reply(
+                await safe_reply(
                     "❌ Удаление задачи отменено.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -2139,7 +2726,7 @@ async def main() -> None:
             task_list = data.get("task_list", [])
             
             if not task_list:
-                await message.reply(
+                await safe_reply(
                     "❌ Список задач устарел. Пожалуйста, начните удаление заново.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -2151,7 +2738,7 @@ async def main() -> None:
                 task_number = int(input_text)
             except ValueError:
                 safe_input = escape(input_text)
-                await message.reply(
+                await safe_reply(
                     f"❌ <code>{safe_input}</code> не является номером задачи.\n\n"
                     "Пожалуйста, введите число (номер задачи из списка).\n"
                     "Или отправьте /cancel для отмены.",
@@ -2162,7 +2749,7 @@ async def main() -> None:
             
             # Проверяем, что номер в допустимом диапазоне
             if task_number < 1 or task_number > len(task_list):
-                await message.reply(
+                await safe_reply(
                     f"❌ Номер задачи должен быть от 1 до {len(task_list)}.\n\n"
                     "Попробуйте еще раз или отправьте /cancel для отмены.",
                     reply_markup=ReplyKeyboardRemove()
@@ -2175,7 +2762,7 @@ async def main() -> None:
             
             if not task:
                 safe_task_id = escape(task_id)
-                await message.reply(
+                await safe_reply(
                     f"❌ Задача с ID <code>{safe_task_id}</code> не найдена.\n\n"
                     "Возможно, она была удалена. Начните удаление заново.",
                     parse_mode="HTML",
@@ -2189,7 +2776,7 @@ async def main() -> None:
             
             # Админы могут удалять любые задачи, остальные - только для своего чата
             if not is_admin and task.chat_id != str(message.chat.id):
-                await message.reply(
+                await safe_reply(
                     "❌ Вы можете удалять только задачи для своего чата.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -2202,7 +2789,7 @@ async def main() -> None:
             
             safe_task_id = escape(task_id)
             safe_message = escape(task.message[:50])
-            await message.reply(
+            await safe_reply(
                 f"✅ Задача <b>№{task_number}</b> успешно удалена.\n\n"
                 f"📋 ID: <code>{safe_task_id}</code>\n"
                 f"📝 Сообщение: {safe_message}...",
