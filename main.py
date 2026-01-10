@@ -1806,6 +1806,7 @@ async def main() -> None:
                 safe_message = escape(message_text)
                 safe_media_str = escape(media_str)
                 await safe_reply(
+                    message,
                     f"✅ Задача добавлена!\n\n"
                     f"📋 ID задачи: <code>{safe_task_id}</code>\n"
                     f"💬 Чат: {target_chat_id}{chat_info}\n"
@@ -2133,6 +2134,7 @@ async def main() -> None:
             page_text, markup = build_edit_task_page(tasks, 0)
 
             await safe_reply(
+                message,
                 page_text,
                 reply_markup=markup,
                 parse_mode="HTML"
@@ -2536,6 +2538,7 @@ async def main() -> None:
                     parts = message.text.split(maxsplit=1)
                     if len(parts) < 2:
                         await safe_reply(
+                            message,
                             "❌ Укажите ID пользователя или ответьте на сообщение пользователя.\n"
                             "Пример: /add_admin 123456789",
                             reply_markup=get_main_menu_keyboard()
@@ -2562,6 +2565,7 @@ async def main() -> None:
                 parts = message.text.split(maxsplit=1)
                 if len(parts) < 2:
                     await safe_reply(
+                        message,
                         "❌ Укажите ID пользователя.\n"
                         "Пример: /remove_admin 123456789",
                         reply_markup=get_main_menu_keyboard()
@@ -2662,6 +2666,7 @@ async def main() -> None:
             # Проверяем, что это текстовое сообщение
             if not message.text:
                 await safe_reply(
+                    message,
                     "❌ Пожалуйста, отправьте текстовое сообщение с номером задачи.\n\n"
                     "Или отправьте /cancel для отмены.",
                     reply_markup=ReplyKeyboardRemove()
@@ -2673,6 +2678,7 @@ async def main() -> None:
             # Проверяем команду отмены
             if input_text.lower() in ['/cancel', 'отмена', 'cancel']:
                 await safe_reply(
+                    message,
                     "❌ Удаление задачи отменено.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -2685,6 +2691,7 @@ async def main() -> None:
             
             if not task_list:
                 await safe_reply(
+                    message,
                     "❌ Список задач устарел. Пожалуйста, начните удаление заново.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -2697,6 +2704,7 @@ async def main() -> None:
             except ValueError:
                 safe_input = escape(input_text)
                 await safe_reply(
+                    message,
                     f"❌ <code>{safe_input}</code> не является номером задачи.\n\n"
                     "Пожалуйста, введите число (номер задачи из списка).\n"
                     "Или отправьте /cancel для отмены.",
@@ -2708,6 +2716,7 @@ async def main() -> None:
             # Проверяем, что номер в допустимом диапазоне
             if task_number < 1 or task_number > len(task_list):
                 await safe_reply(
+                    message,
                     f"❌ Номер задачи должен быть от 1 до {len(task_list)}.\n\n"
                     "Попробуйте еще раз или отправьте /cancel для отмены.",
                     reply_markup=ReplyKeyboardRemove()
@@ -2721,6 +2730,7 @@ async def main() -> None:
             if not task:
                 safe_task_id = escape(task_id)
                 await safe_reply(
+                    message,
                     f"❌ Задача с ID <code>{safe_task_id}</code> не найдена.\n\n"
                     "Возможно, она была удалена. Начните удаление заново.",
                     parse_mode="HTML",
@@ -2735,6 +2745,7 @@ async def main() -> None:
             # Админы могут удалять любые задачи, остальные - только для своего чата
             if not is_admin and task.chat_id != str(message.chat.id):
                 await safe_reply(
+                    message,
                     "❌ Вы можете удалять только задачи для своего чата.",
                     reply_markup=get_main_menu_keyboard()
                 )
@@ -2748,6 +2759,7 @@ async def main() -> None:
             safe_task_id = escape(task_id)
             safe_message = escape(task.message[:50])
             await safe_reply(
+                message,
                 f"✅ Задача <b>№{task_number}</b> успешно удалена.\n\n"
                 f"📋 ID: <code>{safe_task_id}</code>\n"
                 f"📝 Сообщение: {safe_message}...",
