@@ -2782,30 +2782,41 @@ async def main() -> None:
         # Этот обработчик должен быть последним, чтобы не перехватывать команды и кнопки меню
         @dp.message(F.text, StateFilter(None))
         async def unknown_message_handler(message: Message, state: FSMContext) -> None:
-            """Обработчик для неизвестных текстовых сообщений."""
-            # Проверяем, не является ли это командой (начинается с /)
-            if message.text and message.text.startswith('/'):
-                return  # Команды обрабатываются другими обработчиками
-            
-            # Проверяем, не является ли это кнопкой меню
+            user_id = message.from_user.id if message.from_user else None
+            if not user_id or not admin_manager.is_admin(user_id):
+                return
+
+            if (
+                message.reply_to_message
+                and message.reply_to_message.from_user
+                and message.reply_to_message.from_user.is_bot
+            ):
+                return
+
+            if message.text and message.text.startswith("/"):
+                return
+
             menu_buttons = [
-                "📋 Список задач", "➕ Добавить задачу", "✏️ Редактировать задачу",
-                "🗑️ Удалить задачу", "💬 ID чата", "❓ Помощь"
+                "📋 Список задач",
+                "➕ Добавить задачу",
+                "✏️ Редактировать задачу",
+                "🗑️ Удалить задачу",
+                "🧹 Удалить чат",
+                "💬 ID чата",
+                "❓ Помощь",
             ]
             if message.text in menu_buttons:
-                return  # Кнопки меню обрабатываются другими обработчиками
-            
-            user_id = message.from_user.id if message.from_user else None
-            if user_id and admin_manager.is_admin(user_id):
-                # Если это админ, показываем главное меню
-                await safe_reply(
-                    message,
-                    "❓ Неизвестная команда. Используйте кнопки меню или команды:\n"
-                    "/start - Главное меню\n"
-                    "/help - Справка\n"
-                    "/cancel - Отмена операции",
-                    reply_markup=get_main_menu_keyboard()
-                )
+                return
+
+            await safe_reply(
+                message,
+                "❓ Неизвестная команда.\n"
+                "Используйте кнопки меню или команды:\n"
+                "/start\n"
+                "/help\n"
+                "/cancel",
+                reply_markup=get_main_menu_keyboard()
+            )
 
         try:
             await dp.start_polling(bot)
